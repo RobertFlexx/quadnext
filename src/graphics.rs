@@ -1069,6 +1069,22 @@ pub enum Backend {
     OpenGl,
 }
 
+/// Tank Yard: the GPU a backend renders on, where the backend knows it
+/// without an OpenGL query.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceInfo {
+    /// The name the system gives the GPU, such as "Apple M2 Pro".
+    pub name: String,
+    /// The GPU's own memory in MiB. None where it shares the system's.
+    pub memory_mb: Option<u32>,
+    /// The GPU shares memory with the CPU (Apple silicon, Intel graphics).
+    pub unified_memory: bool,
+    /// The integrated GPU of a Mac that also has a discrete one.
+    pub low_power: bool,
+    /// An external GPU.
+    pub removable: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ContextInfo {
     pub backend: Backend,
@@ -1355,6 +1371,58 @@ pub trait RenderingBackend {
     fn end_render_pass(&mut self);
 
     fn commit_frame(&mut self);
+
+    /// Tank Yard: the most samples a multisampled render target may use, if
+    /// the backend knows better than the OpenGL query.
+    fn max_render_samples(&self) -> Option<i32> {
+        None
+    }
+
+    /// Tank Yard: take over an OpenGL texture made elsewhere (one shared
+    /// with Vulkan, say), so its size is known and deleting the returned
+    /// texture deletes it. None on backends that aren't OpenGL.
+    fn adopt_gl_texture(&mut self, _texture: u32, _params: TextureParams) -> Option<TextureId> {
+        None
+    }
+
+    /// Tank Yard: the strongest anisotropic filtering, for backends that
+    /// know it without an OpenGL query.
+    fn max_anisotropy(&self) -> Option<u8> {
+        None
+    }
+
+    /// Tank Yard: set a texture's anisotropic filtering. Returns false when
+    /// the backend leaves this to raw OpenGL calls.
+    fn texture_set_anisotropy(&mut self, _texture: TextureId, _level: u8) -> bool {
+        false
+    }
+
+    /// Tank Yard: whether `spatial_upscale` is available (MetalFX).
+    fn spatial_upscaler_available(&self) -> bool {
+        false
+    }
+
+    /// Tank Yard: upscale `input` into the larger `output` with the system's
+    /// spatial upscaler. Returns false, drawing nothing, when unavailable.
+    fn spatial_upscale(&mut self, _input: TextureId, _output: TextureId) -> bool {
+        false
+    }
+
+    /// Tank Yard: let `read_screen` read the presented image. Some backends
+    /// keep the screen write-only for speed until asked.
+    fn prepare_screen_reads(&mut self) {}
+
+    /// Tank Yard: the current frame's screen image as RGBA8, top row first,
+    /// for backends where macroquad's screen grab is unavailable.
+    fn read_screen(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
+
+    /// Tank Yard: the GPU this backend renders on, for backends that know it
+    /// without an OpenGL query.
+    fn device_info(&self) -> Option<DeviceInfo> {
+        None
+    }
 
     /// Draw elements using currently applied bindings and pipeline.
     ///

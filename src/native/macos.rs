@@ -103,6 +103,10 @@ impl MacosDisplay {
     fn set_fullscreen(&mut self, fullscreen: bool) {
         if self.fullscreen != fullscreen {
             self.fullscreen = fullscreen;
+            // Tank Yard: the move takes most of a second, and the delegate
+            // clears this however it ends. The lock is released first: AppKit
+            // may call the delegate before toggleFullScreen returns.
+            native_display().lock().unwrap().fullscreen_transition = true;
             unsafe {
                 let () = msg_send![self.window, toggleFullScreen: nil];
             }
@@ -425,13 +429,32 @@ pub fn define_cocoa_window_delegate() -> *const Class {
             }
         }
     }
+    // Tank Yard: track full screen moves, including ones the user starts.
+    fn set_fullscreen_transition(moving: bool) {
+        native_display().lock().unwrap().fullscreen_transition = moving;
+    }
+    extern "C" fn window_will_change_fullscreen(_: &Object, _: Sel, _: ObjcId) {
+        set_fullscreen_transition(true);
+    }
     extern "C" fn window_did_enter_fullscreen(this: &Object, _: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
         payload.fullscreen = true;
+        set_fullscreen_transition(false);
     }
     extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
         payload.fullscreen = false;
+        set_fullscreen_transition(false);
+    }
+    extern "C" fn window_did_fail_to_enter_fullscreen(this: &Object, _: Sel, _: ObjcId) {
+        let payload = get_window_payload(this);
+        payload.fullscreen = false;
+        set_fullscreen_transition(false);
+    }
+    extern "C" fn window_did_fail_to_exit_fullscreen(this: &Object, _: Sel, _: ObjcId) {
+        let payload = get_window_payload(this);
+        payload.fullscreen = true;
+        set_fullscreen_transition(false);
     }
     extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: ObjcId) {
         unsafe {
@@ -479,12 +502,28 @@ pub fn define_cocoa_window_delegate() -> *const Class {
             window_did_change_screen as extern "C" fn(&Object, Sel, ObjcId),
         );
         decl.add_method(
+            sel!(windowWillEnterFullScreen:),
+            window_will_change_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(windowWillExitFullScreen:),
+            window_will_change_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
             sel!(windowDidEnterFullScreen:),
             window_did_enter_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
         );
         decl.add_method(
             sel!(windowDidExitFullScreen:),
             window_did_exit_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(windowDidFailToEnterFullScreen:),
+            window_did_fail_to_enter_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(windowDidFailToExitFullScreen:),
+            window_did_fail_to_exit_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
         );
         decl.add_method(
             sel!(windowDidChangeOcclusionState:),
@@ -591,13 +630,10 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     extern "C" fn scroll_wheel(this: &Object, _sel: Sel, event: ObjcId) {
         let payload = get_window_payload(this);
         unsafe {
-            let mut dx: f64 = msg_send![event, scrollingDeltaX];
-            let mut dy: f64 = msg_send![event, scrollingDeltaY];
-
-            if !msg_send![event, hasPreciseScrollingDeltas] {
-                dx *= 10.0;
-                dy *= 10.0;
-            }
+            let dx: f64 = msg_send![event, scrollingDeltaX];
+            let dy: f64 = msg_send![event, scrollingDeltaY];
+            let precise: bool = msg_send![event, hasPreciseScrollingDeltas];
+            native_display().lock().unwrap().mouse_wheel_pixels = precise;
             if let Some(event_handler) = payload.context() {
                 event_handler.mouse_wheel_event(dx as f32, dy as f32);
             }
@@ -982,8 +1018,43 @@ fn get_window_payload(this: &Object) -> &mut MacosDisplay {
     }
 }
 
-unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) -> ObjcId {
-    let mtl_device_obj = MTLCreateSystemDefaultDevice();
+/// Tank Yard: the integrated GPU of a Mac with two, if there is one. The
+/// system default device is the discrete GPU, and creating it switches the
+/// whole Mac over to that GPU.
+unsafe fn low_power_device() -> Option<ObjcId> {
+    let devices = MTLCopyAllDevices();
+    if devices.is_null() {
+        return None;
+    }
+    let count: u64 = msg_send![devices, count];
+    let mut chosen = None;
+    if count > 1 {
+        for index in 0..count {
+            let device: ObjcId = msg_send![devices, objectAtIndex: index];
+            let low_power: BOOL = msg_send![device, isLowPower];
+            let removable: BOOL = msg_send![device, isRemovable];
+            let headless: BOOL = msg_send![device, isHeadless];
+            if low_power == YES && removable != YES && headless != YES {
+                let () = msg_send![device, retain];
+                chosen = Some(device);
+                break;
+            }
+        }
+    }
+    let () = msg_send![devices, release];
+    chosen
+}
+
+unsafe fn create_metal_view(
+    _: &mut MacosDisplay,
+    sample_count: i32,
+    _: bool,
+    low_power: bool,
+) -> ObjcId {
+    let mtl_device_obj = low_power
+        .then(|| low_power_device())
+        .flatten()
+        .unwrap_or_else(|| MTLCreateSystemDefaultDevice());
     let view_class = define_metal_view_class();
     let view: ObjcId = msg_send![view_class, alloc];
     let view: ObjcId = msg_send![view, init];
@@ -994,7 +1065,19 @@ unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) ->
         view,
         setDepthStencilPixelFormat: MTLPixelFormat::Depth32Float_Stencil8
     ];
-    let () = msg_send![view, setSampleCount: sample_count];
+    // Tank Yard: fall back to a sample count this GPU supports.
+    let sample_count = [sample_count, 4, 2, 1]
+        .iter()
+        .copied()
+        .filter(|&count| count <= sample_count.max(1))
+        .find(|&count| {
+            let supported: BOOL =
+                msg_send![mtl_device_obj, supportsTextureSampleCount: count.max(1) as u64];
+            count <= 1 || supported == YES
+        })
+        .unwrap_or(1)
+        .max(1);
+    let () = msg_send![view, setSampleCount: sample_count as u64];
     let () = msg_send![view, setPaused: true];
 
     view
@@ -1005,12 +1088,18 @@ unsafe fn create_opengl_view(
     display: &mut MacosDisplay,
     sample_count: i32,
     high_dpi: bool,
+    low_power: bool,
 ) -> ObjcId {
     use NSOpenGLPixelFormatAttribute::*;
 
     let mut attrs: Vec<u32> = vec![];
 
     attrs.push(NSOpenGLPFAAccelerated as _);
+    // Tank Yard: let a Mac with two GPUs keep rendering on the integrated
+    // one (with NSSupportsAutomaticGraphicsSwitching in Info.plist).
+    if low_power {
+        attrs.push(NSOpenGLPFAAllowOfflineRenderers as _);
+    }
     attrs.push(NSOpenGLPFADoubleBuffer as _);
     attrs.push(NSOpenGLPFAOpenGLProfile as _);
     attrs.push(NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion3_2Core as _);
@@ -1272,17 +1361,19 @@ unsafe fn perform_redraw(
         // reduce CPU usage hen window is in background
         if display.occluded {
             let now = Instant::now();
-            let framerate = 60.0;
+            // Tank Yard: 30 fps, down from 60, for windows nobody can see.
+            let framerate = 30.0;
             let period = (1.0 / framerate * 1000.) as u64;
 
-            match Duration::from_millis(period).checked_sub(now - display.last_paint_start_time) {
-                Some(delay) => {
-                    std::thread::sleep(delay);
-                }
-                None => {
-                    display.last_paint_start_time = now;
-                }
+            // Tank Yard: every frame restarts the period (upstream reset it
+            // only on frames that didn't sleep, so every other frame ran
+            // immediately).
+            if let Some(delay) =
+                Duration::from_millis(period).checked_sub(now - display.last_paint_start_time)
+            {
+                std::thread::sleep(delay);
             }
+            display.last_paint_start_time = Instant::now();
         }
         match apple_gfx_api {
             AppleGfxApi::OpenGl => {
@@ -1384,8 +1475,18 @@ where
     let () = msg_send![window, setTitle: title];
 
     let view = match conf.platform.apple_gfx_api {
-        AppleGfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
-        AppleGfxApi::Metal => create_metal_view(&mut display, conf.sample_count, conf.high_dpi),
+        AppleGfxApi::OpenGl => create_opengl_view(
+            &mut display,
+            conf.sample_count,
+            conf.high_dpi,
+            conf.platform.apple_low_power_gpu,
+        ),
+        AppleGfxApi::Metal => create_metal_view(
+            &mut display,
+            conf.sample_count,
+            conf.high_dpi,
+            conf.platform.apple_low_power_gpu,
+        ),
     };
     {
         let mut d = native_display().lock().unwrap();

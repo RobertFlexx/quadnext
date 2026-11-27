@@ -25,6 +25,7 @@ pub mod raw_gl {
 struct Buffer {
     gl_buf: GLuint,
     buffer_type: BufferType,
+    usage: BufferUsage,
     size: usize,
     // Dimension of the indices for this buffer,
     // used only as a type argument for glDrawElements and can be
@@ -910,12 +911,22 @@ impl RenderingBackend for GlContext {
         TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
     }
 
+    fn adopt_gl_texture(&mut self, texture: u32, params: TextureParams) -> Option<TextureId> {
+        self.textures.0.push(Texture {
+            raw: TextureOrRenderbuffer::Texture(texture),
+            params,
+        });
+        Some(TextureId(TextureIdInner::Managed(self.textures.0.len() - 1)))
+    }
+
     fn delete_texture(&mut self, texture: TextureId) {
         //self.cache.clear_texture_bindings();
 
         let t = self.textures.get(texture);
         match &t.raw {
             TextureOrRenderbuffer::Texture(raw) => unsafe {
+                // Tank Yard: the next texture may reuse this name.
+                self.cache.forget_texture(*raw);
                 glDeleteTextures(1, raw as *const _);
             },
             TextureOrRenderbuffer::Renderbuffer(raw) => unsafe {
@@ -1376,6 +1387,7 @@ impl RenderingBackend for GlContext {
         let buffer = Buffer {
             gl_buf,
             buffer_type: type_,
+            usage,
             size,
             index_type,
         };
@@ -1404,7 +1416,14 @@ impl RenderingBackend for GlContext {
         self.cache.store_buffer_binding(gl_target);
         self.cache
             .bind_buffer(gl_target, buffer.gl_buf, buffer.index_type);
-        unsafe { glBufferSubData(gl_target, 0, size as _, data.ptr as _) };
+        unsafe {
+            // Stream buffers are replaced on each update. Give queued draws
+            // their old storage instead of waiting for them before uploading.
+            if matches!(buffer.usage, BufferUsage::Stream) {
+                glBufferData(gl_target, buffer.size as _, std::ptr::null(), GL_STREAM_DRAW);
+            }
+            glBufferSubData(gl_target, 0, size as _, data.ptr as _);
+        }
         self.cache.restore_buffer_binding(gl_target);
     }
 
